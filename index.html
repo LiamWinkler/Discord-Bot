@@ -1,0 +1,293 @@
+import discord
+from discord.ext import commands
+import asyncio
+import time
+import threading
+import sys
+from datetime import datetime
+import colorama
+import yt_dlp
+
+colorama.init()
+
+TOKEN = "YOUR_DISCORD_BOT_TOKEN"
+
+VOICE_CHANNEL_ID = 1514674314014621840
+LOG_CHANNEL_ID = 1518343689095741603
+
+# ---------------- INTENTS ---------------- #
+
+intents = discord.Intents.default()
+intents.voice_states = True
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+start_time = None
+log_message = None
+status_state = "connecting"
+
+# ---------------- MUSIC ---------------- #
+
+ytdl = yt_dlp.YoutubeDL({
+    "format": "bestaudio/best",
+    "noplaylist": True,
+    "quiet": True
+})
+
+# ---------------- COLORS ---------------- #
+
+class C:
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    RESET = "\033[0m"
+
+# ---------------- TIME ---------------- #
+
+def now():
+    return datetime.now().strftime("%H:%M:%S")
+
+def log(msg, color=C.BLUE):
+    print(f"{color}[{now()}] {msg}{C.RESET}")
+
+def status_log(msg, color=C.CYAN):
+    print(f"{color}[STATUS {now()}] {msg}{C.RESET}")
+
+# ---------------- UTIL ---------------- #
+
+def clear_console(lines=None):
+    if lines is None:
+        print("\033c", end="")
+    else:
+        print("\n" * lines)
+
+def format_time(seconds):
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def get_color():
+    if status_state == "online":
+        return 0x2ECC71
+    if status_state == "connecting":
+        return 0xF1C40F
+    return 0xE74C3C
+
+# ---------------- EMBED ---------------- #
+
+def build_embed(uptime, voice_name):
+    embed = discord.Embed(
+        title="🛰️ System Monitor",
+        color=get_color()
+    )
+    embed.add_field(name="📡 Status", value=status_state.upper(), inline=False)
+    embed.add_field(name="🎧 Voice", value=voice_name, inline=True)
+    embed.add_field(name="⏱️ Uptime", value=uptime, inline=True)
+    return embed
+
+# ---------------- MUSIC ---------------- #
+
+@bot.command()
+async def play(ctx, *, query):
+    if not ctx.author.voice:
+        await ctx.send("❌ Join a voice channel first.")
+        return
+
+    vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+
+    if not vc:
+        vc = await ctx.author.voice.channel.connect()
+
+    loop = asyncio.get_event_loop()
+
+    try:
+        info = await loop.run_in_executor(
+            None,
+            lambda: ytdl.extract_info(f"ytsearch:{query}", download=False)
+        )
+
+        entry = info["entries"][0]
+
+        source = discord.FFmpegPCMAudio(entry["url"], executable="ffmpeg")
+
+        if vc.is_playing():
+            vc.stop()
+
+        vc.play(source)
+
+        await ctx.send(f"🎵 Playing: **{entry['title']}**")
+
+    except Exception as e:
+        await ctx.send(f"❌ Error: {e}")
+
+@bot.command()
+async def stop(ctx):
+    vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+
+    if vc and vc.is_playing():
+        vc.stop()
+        await ctx.send("⏹️ Music stopped.")
+
+# ---------------- VOICE LOG ---------------- #
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member.bot:
+        return
+
+    # JOIN
+    if before.channel is None and after.channel is not None:
+        log(f"{member.name} joined {after.channel.name}", C.GREEN)
+
+    # LEAVE
+    elif before.channel is not None and after.channel is None:
+        log(f"{member.name} left {before.channel.name}", C.RED)
+
+    # MOVE
+    elif before.channel != after.channel:
+        log(f"{member.name} moved {before.channel.name} → {after.channel.name}", C.YELLOW)
+
+    # MUTE / UNMUTE / DEAF / STREAM (only extra logging, nothing else changed)
+    else:
+        if before.mute != after.mute:
+            log(f"{member.name} SERVER-MUTE: {after.mute}", C.RED if after.mute else C.GREEN)
+
+        if before.self_mute != after.self_mute:
+            log(f"{member.name} SELF-MUTE: {after.self_mute}", C.YELLOW if after.self_mute else C.GREEN)
+
+        if before.deaf != after.deaf:
+            log(f"{member.name} SERVER-DEAF: {after.deaf}", C.RED if after.deaf else C.GREEN)
+
+        if before.self_deaf != after.self_deaf:
+            log(f"{member.name} SELF-DEAF: {after.self_deaf}", C.YELLOW if after.self_deaf else C.GREEN)
+
+        if before.self_stream != after.self_stream:
+            log(f"{member.name} STREAM: {after.self_stream}", C.CYAN)
+
+# ---------------- READY ---------------- #
+
+@bot.event
+async def on_ready():
+    global start_time, log_message, status_state
+
+    log(f"Logged in as {bot.user}", C.CYAN)
+
+    voice_channel = bot.get_channel(VOICE_CHANNEL_ID)
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+
+    if not voice_channel or not log_channel:
+        log("Channel not found", C.RED)
+        return
+
+    status_state = "connecting"
+
+    try:
+        vc = discord.utils.get(bot.voice_clients, guild=voice_channel.guild)
+
+        if not vc:
+            await voice_channel.connect(self_mute=False, self_deaf=True)
+
+        start_time = time.time()
+        status_state = "online"
+
+        log_message = await log_channel.send("🟡 System booting...")
+
+        asyncio.create_task(update_loop(voice_channel))
+        asyncio.create_task(status_update_loop(voice_channel))
+
+    except Exception as e:
+        status_state = "error"
+        log(f"Startup error: {e}", C.RED)
+
+# ---------------- DASHBOARD ---------------- #
+
+async def update_loop(channel):
+    global log_message, start_time
+
+    while True:
+        try:
+            if log_message and start_time:
+                uptime = format_time(int(time.time() - start_time))
+                embed = build_embed(uptime, channel.name)
+                await log_message.edit(embed=embed)
+
+        except Exception as e:
+            log(f"Dashboard error: {e}", C.RED)
+
+        await asyncio.sleep(60)
+
+# ---------------- STATUS ---------------- #
+
+async def status_update_loop(channel):
+    global start_time
+
+    while True:
+        try:
+            if start_time:
+                uptime = format_time(int(time.time() - start_time))
+                ping = round(bot.latency * 1000)
+
+                vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
+                voice_status = "connected" if vc else "disconnected"
+
+                status_log(
+                    f"PING: {ping}ms | STATUS: {status_state} | VOICE: {voice_status} | UPTIME: {uptime}",
+                    C.CYAN
+                )
+
+        except Exception as e:
+            status_log(f"Status loop error: {e}", C.RED)
+
+        await asyncio.sleep(60)
+
+# ---------------- CMD ---------------- #
+
+def cmd_listener():
+    while True:
+        try:
+            cmd = input("").strip().lower()
+
+            if cmd == "stop":
+                log("Stopping bot...", C.RED)
+                asyncio.run_coroutine_threadsafe(bot.close(), bot.loop)
+
+            elif cmd == "restart":
+                log("Restarting voice...", C.YELLOW)
+                vc = discord.utils.get(bot.voice_clients)
+                if vc:
+                    asyncio.run_coroutine_threadsafe(vc.disconnect(), bot.loop)
+
+            elif cmd == "exit":
+                log("Exiting bot...", C.RED)
+                asyncio.run_coroutine_threadsafe(bot.close(), bot.loop)
+                sys.exit(0)
+
+            elif cmd.startswith("cls"):
+                parts = cmd.split()
+                if len(parts) == 1:
+                    clear_console()
+                else:
+                    clear_console(int(parts[1]))
+
+            elif cmd.startswith("clear"):
+                parts = cmd.split()
+                if len(parts) == 1:
+                    clear_console()
+                else:
+                    clear_console(int(parts[1]))
+
+            else:
+                status_log("Unknown command", C.YELLOW)
+
+        except Exception as e:
+            log(f"CMD error: {e}", C.RED)
+
+threading.Thread(target=cmd_listener, daemon=True).start()
+
+# ---------------- RUN ---------------- #
+
+bot.run(TOKEN)
